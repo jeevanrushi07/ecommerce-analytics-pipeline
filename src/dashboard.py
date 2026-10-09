@@ -42,10 +42,35 @@ REQUIRED_COLUMNS = [
     "order_date",
     "quantity",
     "unit_price",
-    "unit_cost",
     "category",
     "region"
 ]
+
+PROFIT_REQUIRED_COLUMNS = ["unit_cost"]
+
+def normalize_columns(dataframe):
+    dataframe = dataframe.copy()
+
+    # Support the real UCI Online Retail dataset
+    uci_mapping = {
+        "InvoiceNo": "order_id",
+        "CustomerID": "customer_id",
+        "StockCode": "product_id",
+        "InvoiceDate": "order_date",
+        "Quantity": "quantity",
+        "UnitPrice": "unit_price",
+        "Description": "category",
+        "Country": "region"
+    }
+
+    if "InvoiceNo" in dataframe.columns:
+        dataframe = dataframe.rename(columns=uci_mapping)
+
+    # Keep cost missing if the source does not provide it.
+    if "unit_cost" not in dataframe.columns:
+        dataframe["unit_cost"] = pd.NA
+
+    return dataframe
 
 
 # --------------------------------------------------
@@ -101,28 +126,35 @@ def clean_client_data(dataframe):
         errors="coerce"
     )
 
-    numeric_columns = [
-        "quantity",
-        "unit_price",
-        "unit_cost"
-    ]
-
-    for column in numeric_columns:
+    for column in ["quantity", "unit_price"]:
         dataframe[column] = pd.to_numeric(
             dataframe[column],
             errors="coerce"
         )
 
+    dataframe["unit_cost"] = pd.to_numeric(
+        dataframe["unit_cost"],
+        errors="coerce"
+    )
+
+    # Remove duplicate records and rows missing essential fields.
     dataframe = dataframe.drop_duplicates()
 
     dataframe = dataframe.dropna(
         subset=REQUIRED_COLUMNS
     )
 
+    # Exclude cancellations/returns and invalid sales.
     dataframe = dataframe[
         (dataframe["quantity"] > 0)
         & (dataframe["unit_price"] > 0)
-        & (dataframe["unit_cost"] >= 0)
+    ]
+
+    # Validate costs only when a cost value is supplied.
+    known_costs = dataframe["unit_cost"].notna()
+
+    dataframe = dataframe[
+        (~known_costs) | (dataframe["unit_cost"] >= 0)
     ]
 
     return dataframe.reset_index(drop=True)
@@ -221,6 +253,8 @@ else:
         )
         st.stop()
 
+    uploaded_df = normalize_columns(uploaded_df)
+
     is_valid, missing_columns = (
         validate_client_data(uploaded_df)
     )
@@ -279,61 +313,50 @@ else:
 # PREPARE ANALYTICS DATA
 # --------------------------------------------------
 
+df = normalize_columns(df)
+
 df["order_date"] = pd.to_datetime(
     df["order_date"],
     errors="coerce"
 )
 
-numeric_columns = [
-    "quantity",
-    "unit_price",
-    "unit_cost"
-]
-
-for column in numeric_columns:
+for column in ["quantity", "unit_price", "unit_cost"]:
     df[column] = pd.to_numeric(
         df[column],
         errors="coerce"
     )
 
-
-# Final safety validation
-df = df.dropna(
-    subset=REQUIRED_COLUMNS
-)
+df = df.dropna(subset=REQUIRED_COLUMNS)
 
 df = df[
     (df["quantity"] > 0)
     & (df["unit_price"] > 0)
-    & (df["unit_cost"] >= 0)
 ].copy()
 
+if df.empty:
+    st.error("No valid transaction records remain.")
+    st.stop()
+
+# True only when every remaining transaction has a known cost.
+profit_available = df["unit_cost"].notna().all()
 
 # --------------------------------------------------
 # CALCULATED METRICS
 # --------------------------------------------------
 
-df["revenue"] = (
-    df["quantity"]
-    * df["unit_price"]
-)
+df["revenue"] = df["quantity"] * df["unit_price"]
 
-df["total_cost"] = (
-    df["quantity"]
-    * df["unit_cost"]
-)
+if profit_available:
+    df["total_cost"] = df["quantity"] * df["unit_cost"]
+    df["profit"] = df["revenue"] - df["total_cost"]
 
-df["profit"] = (
-    df["revenue"]
-    - df["total_cost"]
-)
-
-df["profit_margin_pct"] = (
-    df["profit"]
-    / df["revenue"]
-    * 100
-).round(2)
-
+    df["profit_margin_pct"] = (
+        df["profit"] / df["revenue"] * 100
+    ).round(2)
+else:
+    df["total_cost"] = pd.NA
+    df["profit"] = pd.NA
+    df["profit_margin_pct"] = pd.NA
 
 # --------------------------------------------------
 # REFRESH BUTTON
@@ -407,63 +430,39 @@ if filtered_df.empty:
 # KPI CALCULATIONS
 # --------------------------------------------------
 
-total_revenue = (
-    filtered_df["revenue"].sum()
-)
-
-total_profit = (
-    filtered_df["profit"].sum()
-)
-
-total_orders = (
-    filtered_df["order_id"].nunique()
-)
-
-total_customers = (
-    filtered_df["customer_id"].nunique()
-)
-
-profit_margin = (
-    (total_profit / total_revenue) * 100
-    if total_revenue > 0
-    else 0
-)
-
-
-# --------------------------------------------------
-# KPI DISPLAY
-# --------------------------------------------------
+total_revenue = filtered_df["revenue"].sum()
+total_orders = filtered_df["order_id"].nunique()
+total_customers = filtered_df["customer_id"].nunique()
 
 st.subheader("Business Overview")
 
-col1, col2, col3, col4, col5 = (
-    st.columns(5)
-)
+if profit_available:
+    total_profit = filtered_df["profit"].sum()
 
-col1.metric(
-    "Total Revenue",
-    f"₹{total_revenue:,.0f}"
-)
+    profit_margin = (
+        total_profit / total_revenue * 100
+        if total_revenue > 0 else 0
+    )
 
-col2.metric(
-    "Total Profit",
-    f"₹{total_profit:,.0f}"
-)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
-col3.metric(
-    "Profit Margin",
-    f"{profit_margin:.2f}%"
-)
+    col1.metric("Total Revenue", f"{total_revenue:,.2f}")
+    col2.metric("Total Profit", f"{total_profit:,.2f}")
+    col3.metric("Profit Margin", f"{profit_margin:.2f}%")
+    col4.metric("Orders", f"{total_orders:,}")
+    col5.metric("Customers", f"{total_customers:,}")
+else:
+    col1, col2, col3 = st.columns(3)
 
-col4.metric(
-    "Orders",
-    f"{total_orders:,}"
-)
+    col1.metric("Total Revenue", f"{total_revenue:,.2f}")
+    col2.metric("Orders", f"{total_orders:,}")
+    col3.metric("Customers", f"{total_customers:,}")
 
-col5.metric(
-    "Customers",
-    f"{total_customers:,}"
-)
+    st.info(
+        "Profit and profit margin are unavailable because "
+        "the uploaded dataset does not contain product costs."
+    )
+
 
 
 # --------------------------------------------------
@@ -496,25 +495,26 @@ with left_column:
 
 
 with right_column:
+    if profit_available:
+        st.subheader("Profit by Region")
 
-    st.subheader(
-        "Profit by Region"
-    )
-
-    region_profit = (
-        filtered_df
-        .groupby("region")["profit"]
-        .sum()
-        .sort_values(
-            ascending=False
+        region_profit = (
+            filtered_df.groupby("region")["profit"]
+            .sum()
+            .sort_values(ascending=False)
         )
-    )
 
-    st.bar_chart(
-        region_profit,
-        width="stretch"
-    )
+        st.bar_chart(region_profit, width="stretch")
+    else:
+        st.subheader("Sales by Region")
 
+        region_revenue = (
+            filtered_df.groupby("region")["revenue"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        st.bar_chart(region_revenue, width="stretch")
 
 # --------------------------------------------------
 # MONTHLY REVENUE
